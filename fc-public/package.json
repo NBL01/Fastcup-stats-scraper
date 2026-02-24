@@ -5,7 +5,10 @@
   "scripts": {
     "scrape": "node scrape.mjs",
     "stats": "node stats.mjs",
-    "report": "node report.mjs"
+    "report": "node report.mjs",
+    "summary": "node summary.mjs",
+    "maps": "node maps.mjs",
+    "start": "node server.mjs"
   },
   "dependencies": {
     "playwright": "^1.50.0"

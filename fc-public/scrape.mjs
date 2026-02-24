@@ -19,6 +19,10 @@ async function main() {
   const startIndex = Number(process.env.START_INDEX || 0);
   const matchWaitMs = Number(process.env.MATCH_WAIT_MS || 800);
   const responseTimeoutMs = Number(process.env.RESPONSE_TIMEOUT_MS || 8000);
+  const gotoRetries = Number(process.env.GOTO_RETRIES || 3);
+  const gotoRetryDelayMs = Number(process.env.GOTO_RETRY_DELAY_MS || 1200);
+  const skipExisting = process.env.SKIP_EXISTING === "1";
+  const incremental = process.env.INCREMENTAL === "1";
 
   await fs.mkdir(outDir, { recursive: true });
 
@@ -42,38 +46,11 @@ async function main() {
   const browser = await browserType.launch(launchOptions);
   const context = await browser.newContext();
   const page = await context.newPage();
+  const workerCount = Math.max(1, Number(process.env.SCRAPE_WORKERS || "1"));
 
   let counter = 0;
   const seen = new Set();
   const matchIdsFromResponses = new Set();
-
-  function extractMatchIds(value) {
-    const ids = new Set();
-    const stack = [value];
-
-    while (stack.length) {
-      const current = stack.pop();
-      if (!current) continue;
-      if (Array.isArray(current)) {
-        for (const item of current) stack.push(item);
-        continue;
-      }
-      if (typeof current === "object") {
-        for (const [key, item] of Object.entries(current)) {
-          if ((key === "matchId" || key === "match_id") && item) {
-            ids.add(String(item));
-          }
-          if (key === "id" && typeof item === "number") {
-            // Heuristic: match ids are long numeric ids.
-            if (String(item).length >= 7) ids.add(String(item));
-          }
-          stack.push(item);
-        }
-      }
-    }
-
-    return ids;
-  }
 
   function hasMatchPayload(value) {
     if (!value || typeof value !== "object") return false;
@@ -82,7 +59,7 @@ async function main() {
     return false;
   }
 
-  page.on("response", async (response) => {
+  context.on("response", async (response) => {
     try {
       const url = response.url();
       if (!url.includes("fastcup.net")) return;
@@ -125,9 +102,10 @@ async function main() {
         // Ignore JSON parse errors.
       }
 
-      if (bodyJson) {
-        for (const matchId of extractMatchIds(bodyJson)) {
-          matchIdsFromResponses.add(matchId);
+      if (bodyJson?.data?.matchMemberships?.length) {
+        for (const membership of bodyJson.data.matchMemberships) {
+          const matchId = membership?.match?.id;
+          if (matchId) matchIdsFromResponses.add(String(matchId));
         }
       }
 
@@ -165,7 +143,11 @@ async function main() {
   await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
 
   // Scroll to trigger lazy-loaded match entries and their stats requests.
-  for (let i = 0; i < 10; i += 1) {
+  const maxScrolls = Number(process.env.SCROLL_ITERATIONS || 20);
+  let lastMatchLinkCount = 0;
+  let lastResponseIdCount = 0;
+  let stagnantRounds = 0;
+  for (let i = 0; i < maxScrolls; i += 1) {
     await page.evaluate(() => {
       const all = Array.from(document.querySelectorAll("*"));
       let target =
@@ -183,6 +165,19 @@ async function main() {
       target.scrollTop = target.scrollHeight;
     });
     await page.waitForTimeout(1500);
+
+    const linkCount = await page.$$eval("a[href*='/matches/']", (anchors) => {
+      return anchors.length;
+    });
+    const responseCount = matchIdsFromResponses.size;
+    if (linkCount === lastMatchLinkCount && responseCount === lastResponseIdCount) {
+      stagnantRounds += 1;
+      if (stagnantRounds >= 2) break;
+    } else {
+      stagnantRounds = 0;
+      lastMatchLinkCount = linkCount;
+      lastResponseIdCount = responseCount;
+    }
   }
 
   // Collect match links from the matches page.
@@ -220,30 +215,84 @@ async function main() {
     })
     .filter(Boolean);
 
-  let uniqueIds = Array.from(new Set([...matchIds, ...matchIdsFromResponses]));
   const idsFile = path.join(outDir, "match_ids.json");
 
-  try {
-    const saved = JSON.parse(await fs.readFile(idsFile, "utf8"));
-    if (Array.isArray(saved) && saved.length) {
-      uniqueIds = saved;
+  const allIds = Array.from(new Set([...matchIds, ...matchIdsFromResponses]));
+  const sortedAllIds = allIds.sort((a, b) => Number(b) - Number(a));
+
+  let missingIds = sortedAllIds;
+  if (skipExisting) {
+    const existingIds = new Set();
+    const outFiles = await fs.readdir(outDir);
+    for (const file of outFiles) {
+      const match = file.match(/GetMatchStats-(\d+)\.json$/);
+      if (match) existingIds.add(match[1]);
+      const matchGraph = file.match(/graphql-match-(\d+)\.json$/);
+      if (matchGraph) existingIds.add(matchGraph[1]);
+      const nuxtMatch = file.match(/stats-(\d+)\.json$/);
+      if (nuxtMatch) existingIds.add(nuxtMatch[1]);
     }
-  } catch {
-    await fs.writeFile(idsFile, JSON.stringify(uniqueIds, null, 2), "utf8");
+    missingIds = sortedAllIds.filter((id) => !existingIds.has(id));
   }
 
-  const selectedIds = uniqueIds.slice(startIndex, startIndex + maxMatches);
+  let selectedIds = missingIds.slice(startIndex, startIndex + maxMatches);
+
+  if (incremental) {
+    const savedSet = new Set();
+    try {
+      const saved = JSON.parse(await fs.readFile(idsFile, "utf8"));
+      if (Array.isArray(saved)) {
+        for (const id of saved) savedSet.add(String(id));
+      }
+    } catch {
+      // No saved ids yet.
+    }
+    selectedIds = selectedIds.filter((id) => !savedSet.has(id));
+  }
+
+  await fs.writeFile(idsFile, JSON.stringify(sortedAllIds, null, 2), "utf8");
   process.stdout.write(
-    `found ${uniqueIds.length} match id(s); processing ${selectedIds.length} from index ${startIndex}\n`
+    `found ${sortedAllIds.length} match id(s); processing ${selectedIds.length} from index ${startIndex}\n`
   );
 
-  for (const matchId of selectedIds) {
-    const statsUrl = `https://cs2.fastcup.net/matches/${matchId}/stats`;
-    await page.goto(statsUrl, { waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(matchWaitMs);
+  const existingCount = sortedAllIds.length - missingIds.length;
+  process.stdout.write(
+    `PROGRESS total=${selectedIds.length} found=${sortedAllIds.length} existing=${existingCount}\n`
+  );
 
-    // Try to capture inline Nuxt payload if present.
-    const nuxtPayload = await page.evaluate(() => {
+  let processed = 0;
+  const failedMatchIds = [];
+  let nextIndex = 0;
+
+  const scrapeMatch = async (pageInstance, matchId) => {
+    const statsUrl = `https://cs2.fastcup.net/matches/${matchId}/stats`;
+    let navigated = false;
+    let lastError = null;
+    for (let attempt = 1; attempt <= gotoRetries; attempt += 1) {
+      try {
+        await pageInstance.goto(statsUrl, { waitUntil: "domcontentloaded" });
+        navigated = true;
+        break;
+      } catch (err) {
+        lastError = err;
+        process.stderr.write(
+          `goto failed for ${matchId} (attempt ${attempt}/${gotoRetries})\n`
+        );
+        if (attempt < gotoRetries) {
+          await pageInstance.waitForTimeout(gotoRetryDelayMs * attempt);
+        }
+      }
+    }
+    if (!navigated) {
+      failedMatchIds.push(String(matchId));
+      process.stderr.write(
+        `skipping ${matchId}: failed to navigate after ${gotoRetries} attempt(s)\n`
+      );
+      return;
+    }
+    await pageInstance.waitForTimeout(matchWaitMs);
+
+    const nuxtPayload = await pageInstance.evaluate(() => {
       if (typeof window.__NUXT__ !== "undefined") {
         return window.__NUXT__;
       }
@@ -264,9 +313,8 @@ async function main() {
       process.stdout.write(`saved ${filename}\n`);
     }
 
-    // Wait for a GraphQL match response tied to this match ID.
     try {
-      const response = await page.waitForResponse((res) => {
+      const response = await pageInstance.waitForResponse((res) => {
         if (!res.url().includes("graphql")) return false;
         const postData = res.request().postData() || "";
         return postData.includes(`"matchId":${matchId}`) || postData.includes(`"match_id":${matchId}`);
@@ -280,12 +328,39 @@ async function main() {
     } catch {
       // No match response within timeout.
     }
-  }
+  };
+
+  const worker = async (pageInstance) => {
+    while (true) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      if (currentIndex >= selectedIds.length) break;
+      const matchId = selectedIds[currentIndex];
+      processed += 1;
+      process.stdout.write(
+        `PROGRESS current=${processed} total=${selectedIds.length}\n`
+      );
+      await scrapeMatch(pageInstance, matchId);
+    }
+  };
+
+  const pages = await Promise.all(
+    Array.from({ length: workerCount }, () => context.newPage())
+  );
+  await Promise.all(pages.map((p) => worker(p)));
+  await Promise.all(pages.map((p) => p.close()));
 
   // Give any late network calls a chance to finish.
   await page.waitForTimeout(2000);
 
   await browser.close();
+  if (failedMatchIds.length > 0) {
+    process.stderr.write(
+      `failed matches: ${failedMatchIds.length} (${failedMatchIds
+        .slice(0, 10)
+        .join(", ")})\n`
+    );
+  }
   process.stdout.write(`done, saved ${counter} JSON response(s)\n`);
 }
 

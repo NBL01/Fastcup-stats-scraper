@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fastcup Stats Control</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #0b0e14;
+        --panel: #151a24;
+        --panel-2: #1b2130;
+        --text: #eef1f7;
+        --muted: #9aa3b2;
+        --accent: #4dc4ff;
+        font-family: "Space Grotesk", system-ui, sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+      }
+
+      header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 16px 24px;
+        background: var(--panel);
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 1000;
+      }
+
+      .input-wrap {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex: 1;
+      }
+
+      .worker-select {
+        background: #0f141d;
+        color: var(--text);
+        border: 1px solid #2c3445;
+        border-radius: 10px;
+        padding: 8px 10px;
+        font-size: 12px;
+      }
+
+      input {
+        flex: 1;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid #2c3445;
+        background: #0f141d;
+        color: var(--text);
+      }
+
+      button {
+        padding: 10px 14px;
+        border-radius: 10px;
+        border: none;
+        background: var(--accent);
+        color: #0a0c12;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      button.secondary {
+        background: #2a3242;
+        color: var(--text);
+      }
+
+      .status {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .progress {
+        height: 8px;
+        width: 160px;
+        background: #232a3b;
+        border-radius: 999px;
+        overflow: hidden;
+      }
+
+      .progress span {
+        display: block;
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, #4dc4ff, #7ddf94);
+      }
+
+      main {
+        padding: 88px 24px 16px;
+      }
+
+      iframe {
+        width: 100%;
+        height: calc(100vh - 120px);
+        border: none;
+        border-radius: 16px;
+        background: var(--panel-2);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="input-wrap">
+        <input id="profileInput" placeholder="Paste Fastcup profile link or user ID" />
+        <select id="workerCount" class="worker-select" title="Parallel workers">
+          <option value="1">1x</option>
+          <option value="2">2x</option>
+          <option value="3">3x</option>
+          <option value="4">4x</option>
+        </select>
+        <button id="startBtn">Start (full)</button>
+        <button id="refreshBtn" class="secondary">Refresh (new)</button>
+        <button id="resetBtn" class="secondary">Reset</button>
+      </div>
+      <div class="status">
+        <span id="statusText">Idle</span>
+        <div class="progress"><span id="progressBar"></span></div>
+        <span id="progressText">0%</span>
+      </div>
+    </header>
+    <main>
+      <iframe id="reportFrame" src="/report.html"></iframe>
+    </main>
+    <script>
+      const input = document.getElementById("profileInput");
+      const startBtn = document.getElementById("startBtn");
+      const refreshBtn = document.getElementById("refreshBtn");
+      const statusText = document.getElementById("statusText");
+      const progressBar = document.getElementById("progressBar");
+      const progressText = document.getElementById("progressText");
+      const frame = document.getElementById("reportFrame");
+      const resetBtn = document.getElementById("resetBtn");
+      const workerSelect = document.getElementById("workerCount");
+
+      let lastStatus = "idle";
+      let lastProfile = "";
+      let frameReady = false;
+      let pendingReload = false;
+      let resizeTimer = null;
+
+      const normalizeInput = (value) => {
+        const trimmed = String(value || "").trim();
+        if (!trimmed) return "";
+        if (/^\d+$/.test(trimmed)) return `https://cs2.fastcup.net/id${trimmed}/matches`;
+        if (trimmed.includes("fastcup.net")) return trimmed;
+        return "";
+      };
+
+      const setStatus = (text) => {
+        statusText.textContent = text;
+      };
+
+      const updateStatus = async () => {
+        let data;
+        try {
+          const res = await fetch("/api/status");
+          data = await res.json();
+        } catch (err) {
+          setStatus("Error: failed to reach /api/status");
+          return;
+        }
+        const total = data.total || 0;
+        const done = data.done || 0;
+        const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+        lastProfile = data.profile || lastProfile;
+        setStatus(data.status === "running"
+          ? `Scraping (${data.phase}) · ${data.found || total} found · ${data.total || 0} new`
+          : data.status === "done"
+          ? "Done"
+          : data.status === "error"
+          ? `Error: ${data.message || "failed"}`
+          : "Idle");
+        progressBar.style.width = `${pct}%`;
+        progressText.textContent = `${pct}%`;
+        if (data.status === "done" && lastStatus !== "done") {
+          pendingReload = true;
+          if (frameReady) {
+            frameReady = false;
+            const url = `/report.html?ts=${Date.now()}`;
+            frame.src = url;
+            pendingReload = false;
+          }
+        }
+        lastStatus = data.status;
+      };
+
+      setInterval(updateStatus, 1200);
+      updateStatus();
+
+      const resizeFrame = () => {
+        try {
+          const doc = frame.contentDocument;
+          if (!doc) return;
+          const height = Math.max(
+            doc.body?.scrollHeight || 0,
+            doc.documentElement?.scrollHeight || 0
+          );
+          if (height) {
+            frame.style.height = `${height}px`;
+          }
+        } catch {
+          // Cross-origin or not ready.
+        }
+      };
+
+      frame.addEventListener("load", () => {
+        frameReady = true;
+        resizeFrame();
+        if (resizeTimer) clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(resizeFrame, 300);
+        if (resizeTimer) clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(resizeFrame, 1200);
+        if (pendingReload) {
+          frameReady = false;
+          const url = `/report.html?ts=${Date.now()}`;
+          frame.src = url;
+          pendingReload = false;
+        }
+      });
+
+      startBtn.addEventListener("click", async () => {
+        setStatus("Starting full scrape...");
+        const res = await fetch("/api/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ input: input.value, workers: workerSelect.value }),
+        });
+        if (!res.ok) {
+          const data = await res.json();
+          alert(data.error || "Failed to start");
+        }
+      });
+
+      refreshBtn.addEventListener("click", async () => {
+        const normalized = normalizeInput(input.value);
+        if (!normalized) {
+          alert("Paste a valid Fastcup profile link or user ID.");
+          return;
+        }
+        if (lastProfile && normalized !== lastProfile) {
+          if (!confirm("Profile changed. Reset data and run full scrape?")) return;
+          setStatus("Resetting for new profile...");
+          const res = await fetch("/api/reset", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ input: input.value, workers: workerSelect.value }),
+          });
+          if (!res.ok) {
+            const data = await res.json();
+            alert(data.error || "Failed to reset");
+          }
+          return;
+        }
+        if (!confirm("Refresh recent matches?")) return;
+        setStatus("Refreshing new matches...");
+        const res = await fetch("/api/refresh", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ input: input.value, workers: workerSelect.value }),
+        });
+        if (!res.ok) {
+          const data = await res.json();
+          alert(data.error || "Failed to refresh");
+        }
+      });
+
+      resetBtn.addEventListener("click", async () => {
+        if (!confirm("Reset all data and start a full scrape?")) return;
+        setStatus("Resetting...");
+        const res = await fetch("/api/reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ input: input.value, workers: workerSelect.value }),
+        });
+        if (!res.ok) {
+          const data = await res.json();
+          alert(data.error || "Failed to reset");
+        }
+      });
+    </script>
+  </body>
+</html>
